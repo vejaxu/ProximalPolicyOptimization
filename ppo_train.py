@@ -192,15 +192,16 @@ def get_advantages_and_returns(
 def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size):
     samples_list = []
     model.eval()
-    all_prompts = sum([[prompt]*n_samples_per_prompt for prompt in prompts], [])
+    all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in prompts], [])
     for i in range(0, len(all_prompts), micro_rollout_batch_size):
-        prompts = all_prompts[i:i+micro_rollout_batch_size]
+        prompts = all_prompts[i: i + micro_rollout_batch_size]
         inputs = actor_tokenizer(prompts, padding='max_length', max_length=max_length, truncation=True, return_tensors='pt')
         input_ids = inputs['input_ids']
         seqs = model.generate(**inputs.to(device), 
                             max_new_tokens = max_new_tokens, 
                             eos_token_id = eos_token_id, 
                             pad_token_id = pad_token_id)
+        """确保生成长度符合规范，过长则截断，过短则填充"""
         if seqs.size(1) >= max_new_tokens + max_length:
             seqs = seqs[:, :max_new_tokens + max_length]
         else:
@@ -349,7 +350,7 @@ def collate_fn(batch):
     
     return BufferItem(seqs, action_log_probs, values, returns, advantages, attention_mask, action_mask, action_mask.size(1))
     
-    
+
 def train_step(experience, steps):
     
     actor_model.train()
@@ -373,7 +374,6 @@ def train_step(experience, steps):
     log_probs_labels = log_probs.gather(dim=-1, index=sequences[:, 1:].unsqueeze(-1))
     action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
   
-
     
     policy_loss = compute_policy_loss(action_log_probs, old_action_log_probs, advantages,action_mask=action_mask)
     policy_loss.backward()
@@ -397,6 +397,7 @@ def train():
     for episode in range(episodes):
         for rand_prompts in prompts_dataloader:
             # 生成样本（获取模型推理结果）
+            """根据代码超参设置，这一部分我们已经得到了8个句子以及对应生成的部分，并且知道哪些是原本的句子，哪些是生成的句子"""
             samples = generate_samples(rand_prompts, actor_model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size)
             # 生成经验（获取优势、奖励、回报等）
             experiences = generate_experiences(samples)
