@@ -302,9 +302,12 @@ def generate_experiences(samples_list):
         # 在本次实验中，每个prompt都会生成n_samples_per_prompt个sample,
         # 并且由于micro_rollout_batch_size的设置，一个Sample包含了一个prompt生成的所有的sample
         seqs = samples.seqs
+        print(f"seqs shape: {seqs.shape}")
         attention_mask = samples.attention_mask
         action_mask = samples.action_mask
+        print(f"action_mask shape: {action_mask.shape}")
         num_actions = samples.num_actions
+        print(f"num_actions: {num_actions}")
         with torch.no_grad():
             # 计算策略模型输出token的概率
             output = actor_model(seqs, attention_mask=attention_mask)
@@ -320,18 +323,22 @@ def generate_experiences(samples_list):
             ref_action_log_probs = ref_log_probs_labels.squeeze(-1)[:, -num_actions:]
             # 计算价值
             value = critic_model.forward(seqs, attention_mask, num_actions).to(device)
+            print(f"value shape: {value.shape}")
             # 转换成文本
             seq_texts = actor_tokenizer.batch_decode(seqs, skip_special_tokens=True)
             # 计算奖励模型的奖励值
             reward_model_inputs = reward_tokenizer(seq_texts, return_tensors="pt", padding=True) # prompt + response
             r = reward_model(**reward_model_inputs.to(device)).logits # b * 1 一个句子对应一个分数，因此，奖励模型也是很重要的一个组件
+            print(f"reward shape: {r.shape}")
             # 计算kl散度
             kl = compute_approx_kl(
                     action_log_probs,
                     ref_action_log_probs,
                     action_mask=action_mask).to(device)
+            print(f"kl shape: {kl.shape}")
             # 计算实际奖励
             rewards = compute_rewards(kl, r, action_mask, kl_ctl=0.1, clip_reward_value=0.2)
+            print(f"rewards shape: {rewards.shape}")
             # 计算优势和回报
             advantages, returns = get_advantages_and_returns(value, rewards, action_mask, gamma=0.1, lambd=0.2)
         # actor_model.train()
@@ -353,7 +360,6 @@ def generate_experiences(samples_list):
                 kl.detach(),
                 )
             )
-        print(f"experiencs: {len(experiences)}")
 
     return experiences
     
