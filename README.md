@@ -1,2 +1,2 @@
 # ProximalPolicyOptimization
-This repository contains the dataset for PPO alg.
+This project contains the full process implementation of the PPO algorithm for personal learning.
