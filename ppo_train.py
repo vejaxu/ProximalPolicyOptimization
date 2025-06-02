@@ -8,6 +8,8 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
+from datasets import Dataset as datasets_Dataset
+
 
 class PromptDataset(Dataset):
     def __init__(self, prompts, tokenizer, apply_chat_template=False):
@@ -30,6 +32,24 @@ class PromptDataset(Dataset):
     
     def __getitem__(self, index):
         return self.final_prompts[index]
+
+
+def format_prompt(example, tokenizer, apply_chat_template=True):
+    prompt = example('prompt')
+    if apply_chat_template:
+        content = [{"role": "user", "content": prompt}]
+        example["formatted_prompt"] = tokenizer.apply_chat_template(content, tokenize=False, add_generation_prompt=True)
+    else:
+        example["formatted_prompt"] = tokenizer.bos_token + prompt
+    return example
+
+
+def create_prompt_dataset(prompts, tokenizer, apply_chat_template=False):
+    dataset = datasets_Dataset.from_dict({"prompt": prompts})
+    dataset = dataset.map(lambda x: format_prompt(x, tokenizer, apply_chat_template), 
+                          remove_columns=["prompt"]
+    )
+    return dataset
 
 
 class Critic(nn.Module):
@@ -181,7 +201,7 @@ def collate_fn(batch):
 
 def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size):
     samples_list = []
-    model.eval()
+    model.eval() # 采样样本时模型应该eval
     all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in prompts], []) # 合并多个列表
     for i in range(0, len(all_prompts), micro_rollout_batch_size):
         prompts = all_prompts[i: i + micro_rollout_batch_size]
@@ -213,6 +233,7 @@ def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_p
             total_length=attention_mask.float().sum(dim=-1),
         )
         samples_list.append(samples)
+    print(f"samples_list length: {len(samples_list)}")
 
     return samples_list
 
@@ -388,7 +409,7 @@ def train_step(experience, steps):
     action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:]
   
     
-    policy_loss = compute_policy_loss(action_log_probs, old_action_log_probs, advantages,action_mask=action_mask)
+    policy_loss = compute_policy_loss(action_log_probs, old_action_log_probs, advantages, action_mask=action_mask)
     policy_loss.backward()
     optimizer_actor.step()  
     writer.add_scalar("policy_loss", policy_loss.item(), steps)
@@ -412,7 +433,6 @@ def train():
             # 生成样本（获取模型推理结果）
             """根据代码超参设置，这一部分我们已经得到了8个句子以及对应生成的部分，并且知道哪些是原本的句子，哪些是生成的句子"""
             samples = generate_samples(rand_prompts, actor_model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size)
-            print(f"smaples len: {len(samples)}")
             # 生成经验（获取优势、奖励、回报等）
             experiences = generate_experiences(samples)
             buffer.append(experiences)
@@ -479,6 +499,9 @@ if __name__ == "__main__":
     ]
     prompts_dataset = PromptDataset(prompt_list, actor_tokenizer, apply_chat_template=True)
     prompts_dataloader = DataLoader(prompts_dataset, batch_size=rollout_batch_size, shuffle=False)
+    # formatted_dataset = create_prompt_dataset(prompt_list, actor_tokenizer, apply_chat_template=True)
+    # torch_dataset = formatted_dataset.with_format("torch")  # 返回一个 PyTorch 兼容的 dataset
+    # prompts_dataloader = DataLoader(torch_dataset, batch_size=rollout_batch_size, shuffle=False)
    
     train()
     # 整体step数: 3 * 5 * 8 * 2 / 2 / 2 = 60
