@@ -202,32 +202,31 @@ def collate_fn(batch):
 def generate_samples(prompts, model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size):
     samples_list = []
     model.eval() # 采样样本时模型应该eval
-    all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in prompts], []) # 合并多个列表
-    for i in range(0, len(all_prompts), micro_rollout_batch_size):
+    all_prompts = sum([[prompt] * n_samples_per_prompt for prompt in prompts], []) # 一共包含n_samples_per_prompt * len(prompts)个样本
+    for i in range(0, len(all_prompts), micro_rollout_batch_size): # micro_rollout_batch_size与n_samples_per_prompt相对应上，这样每次采样还是对同一个prompt进行采样
         prompts = all_prompts[i: i + micro_rollout_batch_size]
         inputs = actor_tokenizer(prompts, padding='max_length', max_length=max_length, truncation=True, return_tensors='pt')
-        # 每个序列的prompt长度设置为max_length
         input_ids = inputs['input_ids']
         seqs = model.generate(**inputs.to(device), 
                             max_new_tokens = max_new_tokens, # 最大生成长度
                             eos_token_id = eos_token_id, 
                             pad_token_id = pad_token_id)
         
-        if seqs.size(1) >= max_new_tokens + max_length: # 原本的长度加最大生成长度
+        if seqs.shape[1] >= max_new_tokens + max_length: # 生成长度 + prompt长度
             seqs = seqs[:, :max_new_tokens + max_length]
         else:
-            seqs = torch.cat([seqs, torch.full((seqs.size(0), max_new_tokens + max_length - seqs.size(1)), fill_value=pad_token_id, device=seqs.device)], dim=1)
+            seqs = torch.cat([seqs, torch.full((seqs.shape[0], max_new_tokens + max_length - seqs.shape[1]), fill_value=pad_token_id, device=seqs.device)], dim=1)
 
         attention_mask = (seqs.ne(pad_token_id)).to(dtype=torch.long)
         # .ne是tensor自带的操作，逐个元素判断哪些元素不是pad_token_id
-        ans = seqs[:, input_ids.size(1):] # 生成的部分
-        action_mask = (ans.ne(eos_token_id) & ans.ne(pad_token_id)).to(dtype=torch.long) # 去除生成的部分中没有用的token，比如填充
+        ans = seqs[:, input_ids.shape[1]:] # 生成的部分
+        action_mask = (ans.ne(eos_token_id) & ans.ne(pad_token_id)).to(dtype=torch.long) # 生成部分的mask，去掉eos_token_id和pad_token_id，获得真正生成部分的mask
 
         samples = Samples(
             seqs=seqs,
-            attention_mask=attention_mask,
-            action_mask=action_mask,
-            num_actions=action_mask.size(1),
+            attention_mask=attention_mask, # 整个样本的mask，包含prompt与response
+            action_mask=action_mask, # response部分的mask，包含eos_token_id和pad_token_id
+            num_actions=action_mask.shape[1],
             packed_seq_lens=None,
             response_length=action_mask.float().sum(dim=-1),
             total_length=attention_mask.float().sum(dim=-1),
@@ -246,7 +245,6 @@ def compute_approx_kl(
     log_ratio = log_probs.float() - ref_log_probs.float()
     if action_mask is not None:
         log_ratio = log_ratio * action_mask # 只计算生成部分的KL散度
-        # 为什么需要action_mask: attention_mask包含了整个句子的mask，但是我们只需要生成部分的mask，所以把prompt部分的mask删除就是action_mask
     return log_ratio
 
 
@@ -300,7 +298,6 @@ def get_advantages_and_returns(
 
 
 def generate_experiences(samples_list):
-    # 根据sample生成experience
     """
     samples = Samples(
         seqs=seqs,
@@ -320,8 +317,6 @@ def generate_experiences(samples_list):
     experiences = []
     
     for samples in samples_list:
-        # 在本次实验中，每个prompt都会生成n_samples_per_prompt个sample,
-        # 并且由于micro_rollout_batch_size的设置，一个Sample包含了一个prompt生成的所有的sample
         seqs = samples.seqs
         print(f"seqs shape: {seqs.shape}")
         attention_mask = samples.attention_mask
@@ -331,9 +326,9 @@ def generate_experiences(samples_list):
         print(f"num_actions: {num_actions}")
         with torch.no_grad():
             # 计算策略模型输出token的概率
-            output = actor_model(seqs, attention_mask=attention_mask)
-            logits = output.logits # 得到每个句子，每个词的词表的概率分布，这个的基础实现有兴趣可以了解一下
-            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1) # 当前token的logits是用来预测下一个token的，但是最后一个token没有下一个词
+            output = actor_model(seqs, attention_mask=attention_mask) # b n 
+            logits = output.logits # b n vocab_size
+            log_probs = F.log_softmax(logits[:, :-1, :], dim=-1) # b (n-1) vocab_size
             log_probs_labels = log_probs.gather(dim=-1, index=seqs[:, 1:].unsqueeze(-1)) # 这是上一行操作的标签，后一个token是前一个的label
             action_log_probs = log_probs_labels.squeeze(-1)[:, -num_actions:] # 取出生成部分的log概率值 b * num_actions
             #计算参考模型输出token的概率
@@ -381,6 +376,7 @@ def generate_experiences(samples_list):
                 kl.detach(),
                 )
             )
+    print(f"experiences length: {len(experiences)}")
 
     return experiences
     
@@ -425,15 +421,12 @@ def train_step(experience, steps):
     
 
 def train():
-    # 初始化经验池
     buffer = ExperienceBuffer(limit=100)
     steps = 0
     for episode in range(episodes):
-        for rand_prompts in prompts_dataloader:
-            # 生成样本（获取模型推理结果）
-            """根据代码超参设置，这一部分我们已经得到了8个句子以及对应生成的部分，并且知道哪些是原本的句子，哪些是生成的句子"""
-            samples = generate_samples(rand_prompts, actor_model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size)
-            # 生成经验（获取优势、奖励、回报等）
+        for rand_prompts in prompts_dataloader: # 每次取8条prompt进行采样
+            samples = generate_samples(rand_prompts, actor_model, max_length, max_new_tokens, n_samples_per_prompt, micro_rollout_batch_size) # 每次取8个prompt，每个prompt生成2个样本，并且在采样过程中，一次只采样2条数据
+            # samples是一个列表，元素是Samples对象，长度为8，每个Sample包含了2条采样样本
             experiences = generate_experiences(samples)
             buffer.append(experiences)
             dataloader = DataLoader(buffer, batch_size=micro_train_batch_size, shuffle=True, collate_fn=collate_fn)
@@ -450,41 +443,28 @@ def train():
 
 if __name__ == "__main__":
     device = 'cuda:1' if torch.cuda.is_available() else 'cpu'
-    # 一共迭代多少轮
-    episodes = 3
-    # 生成一次经验，训练的轮数
-    max_epochs = 5
-    # 一次从提示词数据集中取多少条数据用于生成经验
-    rollout_batch_size = 8
-    # 一次取多少条数据生成经验（生成经验需要多个模型推理，对显存要求高）
-    micro_rollout_batch_size = 2
-    # 一个提示词生成多少个样本
-    n_samples_per_prompt = 2
-    # 生成的最大长度，相当于最大动作数，数值越大，模型探索的可能性越多
-    max_new_tokens = 50
-    # 最大长度
+    episodes = 3 # 一共迭代多少轮
+    max_epochs = 5 # 生成一次经验，训练的轮数
+    rollout_batch_size = 8 # 一次从提示词数据集中取多少条数据用于生成经验
+    micro_rollout_batch_size = 2 # 一次取多少条数据生成经验（生成经验需要多个模型推理，对显存要求高）
+    n_samples_per_prompt = 2 # 一个提示词生成多少个样本
+    max_new_tokens = 50 # 生成的最大长度，相当于最大动作数，数值越大，模型探索的可能性越多
     max_length = 256
-    # 实际训练的batch_size大小，一次取多少条数据用于更新参数
-    micro_train_batch_size = 2
-    # 记录日志
+    micro_train_batch_size = 2 # 实际训练的batch_size大小，一次取多少条数据用于更新参数
+
     writer = SummaryWriter('runs')
-    # 策略模型
+
     actor_model = AutoModelForCausalLM.from_pretrained('/home/xwj/Model/qwen2.5-0.5b-instruct').to(device)
-    # 参考模型
     ref_model = AutoModelForCausalLM.from_pretrained('/home/xwj/Model/qwen2.5-0.5b-instruct').to(device)
-    # 奖励模型
     reward_model = AutoModelForSequenceClassification.from_pretrained('/home/xwj/Model/reward-model-deberta-v3-large-v2').to(device)
     actor_tokenizer = AutoTokenizer.from_pretrained('/home/xwj/Model/qwen2.5-0.5b-instruct')
     reward_tokenizer = AutoTokenizer.from_pretrained('/home/xwj/Model/reward-model-deberta-v3-large-v2')
-    # 价值模型
     critic_model = Critic(actor_model.base_model).to(device)
     
-    # 初始化优化器
     optimizer_actor = torch.optim.Adam(actor_model.parameters(), lr=0.00005)
     optimizer_critic = torch.optim.Adam(critic_model.parameters(), lr=0.00005)
     
-    # 填充方式为左填充
-    actor_tokenizer.padding_side = 'left'
+    actor_tokenizer.padding_side = 'left' # 对最后一个token打分才有意义
     eos_token_id = actor_tokenizer.eos_token_id
     pad_token_id = actor_tokenizer.pad_token_id
     prompt_list = [
@@ -504,4 +484,4 @@ if __name__ == "__main__":
     # prompts_dataloader = DataLoader(torch_dataset, batch_size=rollout_batch_size, shuffle=False)
    
     train()
-    # 整体step数: 3 * 5 * 8 * 2 / 2 / 2 = 60
+    # episode * 8条经验 * 每个经验用5次 / 每次用2条经验 = 60
